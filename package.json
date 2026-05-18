@@ -1,0 +1,17 @@
+{
+  "name": "chatbot-evals",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LLM eval pipeline for a Vercel AI SDK chatbot, with telemetry round-trip through Bronto.",
+  "scripts": {
+    "run": "tsx scripts/eval/run-all.ts",
+    "phase1": "tsx scripts/eval/run-eval.ts",
+    "phase2": "tsx scripts/eval/score-eval.ts",
+    "report": "tsx scripts/eval/report.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.7.1",
+    "typescript": "^5"
+  }
+}

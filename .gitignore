@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+
+# Pipeline output
+/eval-results/
+
+# OS / editor
+.DS_Store
+*.tsbuildinfo

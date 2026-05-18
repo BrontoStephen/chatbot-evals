@@ -116,15 +116,81 @@ function clamp(n: unknown): number {
 }
 
 async function fetchFromBronto(runId: string): Promise<RawRow[]> {
+    const mode = envOrDefault('BRONTO_SOURCE', 'traces').toLowerCase();
+    if (mode === 'traces') return fetchFromTraces(runId);
+    return fetchFromLogs(runId);
+}
+
+// Query the .traces collection where streamText's experimental_telemetry
+// lands one ai.streamText span per request with the prompt, response text,
+// usage tokens, and our eval metadata as typed attributes.
+async function fetchFromTraces(runId: string): Promise<RawRow[]> {
+    const apiKey = requireEnv('BRONTO_API_KEY');
+    const region = envOrDefault('BRONTO_REGION', 'eu').toLowerCase();
+    const tracesDataset = envOrDefault('BRONTO_TRACES_DATASET', 'vercel-ai-demo');
+    const tracesCollection = envOrDefault('BRONTO_TRACES_COLLECTION', '.traces');
+
+    const url = `https://api.${region}.bronto.io/search`;
+    const body = {
+        from_expr: `dataset = '${tracesDataset}' AND collection = '${tracesCollection}'`,
+        time_range: 'Last 1 hour',
+        select: ['*'],
+        where: `"$span.name"='ai.streamText' AND "$ai.telemetry.metadata.eval_run_id"='${runId}'`,
+        limit: 100,
+        most_recent_first: true,
+    };
+
+    log('info', 'Querying Bronto traces', { url, runId, tracesDataset, tracesCollection });
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-BRONTO-API-KEY': apiKey },
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`Bronto search ${res.status}: ${(await res.text()).slice(0, 500)}`);
+
+    const data = (await res.json()) as { events?: Array<{ attributes?: Record<string, unknown> }> };
+    const events = data.events ?? [];
+    log('info', 'Bronto trace events returned', { count: events.length });
+
+    const byCase = new Map<string, RawRow>();
+    for (const ev of events) {
+        const a = ev.attributes ?? {};
+        const caseId = String(a['$ai.telemetry.metadata.eval_case_id'] ?? '');
+        if (!caseId) continue;
+        const output = String(a['$ai.response.text'] ?? '');
+        const input = extractPromptText(a['$ai.prompt']);
+        const inputTokens = Number(a['$ai.usage.inputTokens'] ?? 0);
+        const outputTokens = Number(a['$ai.usage.outputTokens'] ?? 0);
+        const durNano = Number(a['$span.duration_nano'] ?? 0);
+        const latencyMs = durNano > 0 ? Math.round(durNano / 1_000_000) : 0;
+        const existing = byCase.get(caseId);
+        if (!existing || (output && !existing.output)) {
+            byCase.set(caseId, {
+                caseId,
+                input,
+                output,
+                tags: EVAL_CASES.find((c) => c.id === caseId)?.tags ?? [],
+                latencyMs,
+                firstByteMs: 0,
+                error: null,
+                inputTokens,
+                outputTokens,
+            });
+        }
+    }
+    return Array.from(byCase.values());
+}
+
+// Legacy Log Drain path (vercel/chatbot dataset, @raw LIKE matches).
+// Kept as a fallback for environments without a traces drain.
+async function fetchFromLogs(runId: string): Promise<RawRow[]> {
     const apiKey = requireEnv('BRONTO_API_KEY');
     const region = envOrDefault('BRONTO_REGION', 'eu').toLowerCase();
     const dataset = requireEnv('BRONTO_DATASET');
     const collection = requireEnv('BRONTO_COLLECTION');
 
     const url = `https://api.${region}.bronto.io/search`;
-    // Bronto's vercel/chatbot dataset stores Vercel Log Drain stdout where the
-    // structured log payload is stringified inside a "message" field that the
-    // parser does not expand into attributes. So filter on @raw LIKE.
     const body = {
         from_expr: `dataset = '${dataset}' AND collection = '${collection}'`,
         time_range: 'Last 1 hour',
@@ -134,47 +200,31 @@ async function fetchFromBronto(runId: string): Promise<RawRow[]> {
         most_recent_first: true,
     };
 
-    log('info', 'Querying Bronto', { url, runId, dataset });
+    log('info', 'Querying Bronto logs (fallback)', { url, runId, dataset });
 
     const res = await fetch(url, {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-BRONTO-API-KEY': apiKey,
-        },
+        headers: { 'Content-Type': 'application/json', 'X-BRONTO-API-KEY': apiKey },
         body: JSON.stringify(body),
     });
+    if (!res.ok) throw new Error(`Bronto search ${res.status}: ${(await res.text()).slice(0, 500)}`);
 
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Bronto search ${res.status}: ${text.slice(0, 500)}`);
-    }
-
-    const data = (await res.json()) as {
-        events?: Array<{
-            '@raw'?: string;
-            attributes?: Record<string, unknown>;
-        }>;
-    };
+    const data = (await res.json()) as { events?: Array<{ '@raw'?: string }> };
     const events = data.events ?? [];
+    log('info', 'Bronto log events returned', { count: events.length });
 
-    log('info', 'Bronto events returned', { count: events.length });
-
-    // Vercel Log Drain payloads: @raw is the Vercel envelope JSON;
-    // envelope.message is another JSON string containing the logWithStatement payload.
     const byCase = new Map<string, RawRow>();
     for (const ev of events) {
         const inner = parseVercelLog(ev['@raw']);
         if (!inner) continue;
-        const data = (inner.data ?? {}) as Record<string, unknown>;
-        const caseId = String(data['eval_case_id'] ?? data['x-eval-case-id'] ?? '');
+        const d = (inner.data ?? {}) as Record<string, unknown>;
+        const caseId = String(d['eval_case_id'] ?? d['x-eval-case-id'] ?? '');
         if (!caseId) continue;
-        const output = String(data['ai.output.text'] ?? data['aiOutputText'] ?? '');
-        const input = extractInputText(data['ai.prompt.messages']);
-        const inputTokens = Number(data['aiUsagePromptTokens'] ?? data['ai.usage.prompt_tokens'] ?? 0);
-        const outputTokens = Number(data['aiUsageCompletionTokens'] ?? data['ai.usage.completion_tokens'] ?? 0);
+        const output = String(d['ai.output.text'] ?? d['aiOutputText'] ?? '');
+        const input = extractInputText(d['ai.prompt.messages']);
+        const inputTokens = Number(d['aiUsagePromptTokens'] ?? d['ai.usage.prompt_tokens'] ?? 0);
+        const outputTokens = Number(d['aiUsageCompletionTokens'] ?? d['ai.usage.completion_tokens'] ?? 0);
         const existing = byCase.get(caseId);
-        // prefer the row that has output text
         if (!existing || (output && !existing.output)) {
             byCase.set(caseId, {
                 caseId,
@@ -197,12 +247,24 @@ function parseVercelLog(raw: string | undefined): { message?: string; data?: unk
     try {
         const envelope = JSON.parse(raw) as { message?: string };
         if (!envelope.message) return null;
-        // envelope.message can be a stringified JSON or a plain string
         const inner = JSON.parse(envelope.message) as { message?: string; data?: unknown };
         return inner;
     } catch {
         return null;
     }
+}
+
+function extractPromptText(raw: unknown): string {
+    if (raw == null) return '';
+    if (typeof raw === 'string') {
+        try {
+            const parsed = JSON.parse(raw) as { messages?: unknown };
+            return extractInputText(parsed.messages);
+        } catch {
+            return raw;
+        }
+    }
+    return extractInputText(raw);
 }
 
 function extractOutputText(raw: unknown): string {

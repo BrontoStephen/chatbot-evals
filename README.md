@@ -19,8 +19,10 @@ A convenience driver `run-all.ts` chains all three phases with a configurable
 wait between Phase 1 and Phase 2 so Bronto's Log Drain has time to ingest the
 chat events.
 
-See [`examples/run-demo-1779108303/report.md`](examples/run-demo-1779108303/report.md)
-for an end-to-end run output.
+See [`examples/run-traces-1779110399/report.md`](examples/run-traces-1779110399/report.md)
+for the canonical end-to-end run output (traces source, 8/8 passed, avg 5.0).
+[`examples/run-demo-1779108303/report.md`](examples/run-demo-1779108303/report.md)
+is the earlier logs-source run for reference.
 
 ## How it tags requests
 
@@ -79,28 +81,67 @@ npx tsx scripts/eval/score-eval.ts --run <run-id> --source local
 npx tsx scripts/eval/report.ts --run <run-id>
 ```
 
-## Notes from the first end-to-end run
+## Source modes
+
+Phase 2 can pull the chatbot's responses either from Bronto's Traces drain
+(preferred) or from the Vercel Logs drain. Set `BRONTO_SOURCE`:
+
+- **`BRONTO_SOURCE=traces`** (default): query
+  `dataset = '${BRONTO_TRACES_DATASET}' AND collection = '${BRONTO_TRACES_COLLECTION}'`
+  for `ai.streamText` spans with
+  `"$ai.telemetry.metadata.eval_run_id"='<run-id>'`. Pulls
+  `$ai.response.text`, `$ai.prompt`, `$ai.usage.{input,output}Tokens`, and
+  span duration as first-class indexed attributes. Requires:
+  - `experimental_telemetry: { isEnabled: true, metadata: { eval_run_id, eval_case_id } }`
+    on the `streamText` call in your chatbot's `/api/chat` route.
+  - A Vercel **Traces** drain configured to Bronto's
+    `https://ingestion.<region>.bronto.io/v1/traces` endpoint.
+- **`BRONTO_SOURCE=logs`**: fall back to the Logs drain dataset and filter
+  with `@raw LIKE '%<run-id>%'`. Brittle string match; only useful when you
+  don't have Traces drain set up.
+
+## Notes from the end-to-end runs
 
 These are quirks of this particular setup that the scripts already work around:
 
 - **AI SDK v6 SSE format**: response is `data: {"type":"text-delta","delta":"..."}\n\n`,
   not the legacy `0:"..."` prefix. The client parses SSE and concatenates
   `text-delta` events.
-- **Bronto Search API**: path is `/search` (not `/v1/search`); `from` and
-  `select` are arrays; query by dataset name uses `from_expr`.
-- **Bronto vercel/chatbot parser** does **not** expand the nested JSON inside
-  the Log Drain envelope's `message` field, so the `where` clause uses
-  `@raw LIKE '%run-id%'` rather than typed attribute matching.
-- **Vercel `onFinish` may not flush** before Lambda shutdown for the longest
-  streams — `score-eval` falls back to the local raw captures automatically
-  when Bronto returns fewer events than expected.
+- **Bronto Search API**: path is `/search` (not `/v1/search`); `from`,
+  `select` are arrays; query by dataset name uses `from_expr`; use
+  `select: ["*"]` to get all attributes back.
+- **Attribute namespace is `$ai.*` not `$gen_ai.*`**: the Vercel AI SDK
+  emits its own `ai.*` semantic-convention names rather than OTel's
+  GenAI conventions. Once on Bronto they're prefixed with `$`.
+- **`maxDuration` matters**: if the Lambda is killed mid-stream, the
+  `ai.streamText` span never records `ai.response.text` or `ai.usage.*`.
+  Set `maxDuration` ≥ ~60 s for explanation-style prompts on gpt-4-turbo.
+- **Vercel `onFinish` may still not flush** for the longest streams —
+  `score-eval` falls back to the local raw captures automatically when the
+  Bronto query returns fewer events than expected.
 - **Anthropic rate limit** on `claude-sonnet-4-20250514` is 5 req/min on
   default tier — the script paces calls at one every 13 s with 429-backoff
   retries.
 
 ## Sanity-checking the Bronto round trip
 
-After a run, you can list the score events that were written back:
+After a run, you can list the original chat traces …
+
+```bash
+curl -s -X POST "https://api.eu.bronto.io/search" \
+  -H "X-BRONTO-API-KEY: $BRONTO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_expr": "dataset = \"vercel-ai-demo\" AND collection = \".traces\"",
+    "time_range": "Last 1 hour",
+    "select": ["*"],
+    "where":  "\"$span.name\"=\"ai.streamText\" AND \"$ai.telemetry.metadata.eval_run_id\"=\"<your-run-id>\"",
+    "limit":  50,
+    "most_recent_first": true
+  }'
+```
+
+… and the score events that were written back:
 
 ```bash
 curl -s -X POST "https://api.eu.bronto.io/search" \
@@ -121,7 +162,7 @@ attached to your Claude Code session:
 
 ```
 mcp__bronto__search_logs \
-  where='@raw LIKE "%<your-run-id>%" AND @raw LIKE "%llm_eval_score%"' \
+  where='"$span.name"="ai.streamText" AND "$ai.telemetry.metadata.eval_run_id"="<your-run-id>"' \
   limit=50
 ```
 
